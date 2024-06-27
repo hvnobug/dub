@@ -1,14 +1,21 @@
+import { getDomainOrThrow } from "@/lib/api/domains/get-domain-or-throw";
 import { DubApiError, ErrorCodes } from "@/lib/api/errors";
 import { createLink, getLinksForWorkspace, processLink } from "@/lib/api/links";
-import { withAuth } from "@/lib/auth";
-import { LinkWithTagIdsProps } from "@/lib/types";
+import { throwIfLinksUsageExceeded } from "@/lib/api/links/usage-checks";
+import { parseRequestBody } from "@/lib/api/utils";
+import { withWorkspace } from "@/lib/auth";
 import { ratelimit } from "@/lib/upstash";
-import { createLinkBodySchema, getLinksQuerySchema } from "@/lib/zod/schemas";
-import { LOCALHOST_IP } from "@dub/utils";
+import {
+  createLinkBodySchema,
+  getLinksQuerySchemaExtended,
+} from "@/lib/zod/schemas/links";
+import { LOCALHOST_IP, getSearchParamsWithArray } from "@dub/utils";
 import { NextResponse } from "next/server";
 
 // GET /api/links – get all links for a workspace
-export const GET = withAuth(async ({ headers, searchParams, workspace }) => {
+export const GET = withWorkspace(async ({ req, headers, workspace }) => {
+  const searchParams = getSearchParamsWithArray(req.url);
+
   const {
     domain,
     tagId,
@@ -19,7 +26,12 @@ export const GET = withAuth(async ({ headers, searchParams, workspace }) => {
     userId,
     showArchived,
     withTags,
-  } = getLinksQuerySchema.parse(searchParams);
+    includeUser,
+  } = getLinksQuerySchemaExtended.parse(searchParams);
+
+  if (domain) {
+    await getDomainOrThrow({ workspace, domain });
+  }
 
   const response = await getLinksForWorkspace({
     workspaceId: workspace.id,
@@ -32,6 +44,7 @@ export const GET = withAuth(async ({ headers, searchParams, workspace }) => {
     userId,
     showArchived,
     withTags,
+    includeUser,
   });
 
   return NextResponse.json(response, {
@@ -40,18 +53,13 @@ export const GET = withAuth(async ({ headers, searchParams, workspace }) => {
 });
 
 // POST /api/links – create a new link
-export const POST = withAuth(
+export const POST = withWorkspace(
   async ({ req, headers, session, workspace }) => {
-    let bodyRaw;
-    try {
-      bodyRaw = await req.json();
-    } catch (error) {
-      throw new DubApiError({
-        code: "bad_request",
-        message: "Invalid body – body must be a valid JSON.",
-      });
+    if (workspace) {
+      throwIfLinksUsageExceeded(workspace);
     }
-    const body = createLinkBodySchema.parse(bodyRaw);
+
+    const body = createLinkBodySchema.parse(await parseRequestBody(req));
 
     if (!session) {
       const ip = req.headers.get("x-forwarded-for") || LOCALHOST_IP;
@@ -67,24 +75,36 @@ export const POST = withAuth(
     }
 
     const { link, error, code } = await processLink({
-      payload: body as LinkWithTagIdsProps,
+      payload: body,
       workspace,
       ...(session && { userId: session.user.id }),
     });
 
-    if (error) {
+    if (error != null) {
       throw new DubApiError({
         code: code as ErrorCodes,
         message: error,
       });
     }
 
-    const response = await createLink(link);
+    try {
+      const response = await createLink(link);
+      return NextResponse.json(response, { headers });
+    } catch (error) {
+      if (error.code === "P2002") {
+        throw new DubApiError({
+          code: "conflict",
+          message: "A link with this externalId already exists.",
+        });
+      }
 
-    return NextResponse.json(response, { headers });
+      throw new DubApiError({
+        code: "unprocessable_entity",
+        message: error.message,
+      });
+    }
   },
   {
-    needNotExceededLinks: true,
     allowAnonymous: true,
   },
 );

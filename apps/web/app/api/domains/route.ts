@@ -1,45 +1,38 @@
+import { addDomainToVercel, validateDomain } from "@/lib/api/domains";
+import { DubApiError, exceededLimitError } from "@/lib/api/errors";
+import { parseRequestBody } from "@/lib/api/utils";
+import { withWorkspace } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
 import {
-  addDomainToVercel,
-  setRootDomain,
-  validateDomain,
-} from "@/lib/api/domains";
-import { exceededLimitError } from "@/lib/api/errors";
-import { withAuth } from "@/lib/auth";
-import prisma from "@/lib/prisma";
+  DomainSchema,
+  createDomainBodySchema,
+} from "@/lib/zod/schemas/domains";
 import { NextResponse } from "next/server";
+import { z } from "zod";
 
 // GET /api/domains – get all domains for a workspace
-export const GET = withAuth(async ({ workspace }) => {
+export const GET = withWorkspace(async ({ workspace }) => {
   const domains = await prisma.domain.findMany({
     where: {
       projectId: workspace.id,
     },
-    select: {
-      slug: true,
-      verified: true,
-      primary: true,
-      archived: true,
-      target: true,
-      type: true,
-      placeholder: true,
-      clicks: true,
-      expiredUrl: true,
-    },
   });
-  return NextResponse.json(domains);
+
+  return NextResponse.json(z.array(DomainSchema).parse(domains));
 });
 
 // POST /api/domains - add a domain
-export const POST = withAuth(async ({ req, workspace }) => {
-  const {
-    slug: domain,
-    target,
-    type,
-    expiredUrl,
-    placeholder,
-  } = await req.json();
+export const POST = withWorkspace(async ({ req, workspace }) => {
+  const body = await parseRequestBody(req);
+  const { slug, placeholder, expiredUrl } = createDomainBodySchema.parse(body);
 
-  if (workspace.domains.length >= workspace.domainsLimit) {
+  const totalDomains = await prisma.domain.count({
+    where: {
+      projectId: workspace.id,
+    },
+  });
+
+  if (totalDomains >= workspace.domainsLimit) {
     return new Response(
       exceededLimitError({
         plan: workspace.plan,
@@ -50,12 +43,24 @@ export const POST = withAuth(async ({ req, workspace }) => {
     );
   }
 
-  const validDomain = await validateDomain(domain);
-
-  if (validDomain !== true) {
-    return new Response(validDomain, { status: 422 });
+  if (workspace.plan === "free" && expiredUrl) {
+    throw new DubApiError({
+      code: "forbidden",
+      message:
+        "You can only use Default Expiration URLs on a Pro plan and above. Upgrade to Pro to use these features.",
+    });
   }
-  const vercelResponse = await addDomainToVercel(domain);
+
+  const validDomain = await validateDomain(slug);
+
+  if (validDomain.error && validDomain.code) {
+    throw new DubApiError({
+      code: validDomain.code,
+      message: validDomain.error,
+    });
+  }
+
+  const vercelResponse = await addDomainToVercel(slug);
 
   if (
     vercelResponse.error &&
@@ -63,35 +68,20 @@ export const POST = withAuth(async ({ req, workspace }) => {
   ) {
     return new Response(vercelResponse.error.message, { status: 422 });
   }
-  /* 
-          If the domain is being added, we need to:
-            1. Add the domain to Vercel
-            2. If there's a landing page set, update the root domain in Redis
-            3. If the workspace has no domains (meaning this is the first domain added), set it as primary
-        */
-  const response = await prisma.domain.create({
+
+  const domainRecord = await prisma.domain.create({
     data: {
-      slug: domain,
-      type,
+      slug: slug,
       projectId: workspace.id,
-      primary: workspace.domains.length === 0,
-      placeholder,
+      primary: totalDomains === 0,
+      ...(placeholder && { placeholder }),
       ...(workspace.plan !== "free" && {
-        target,
         expiredUrl,
       }),
     },
   });
 
-  await setRootDomain({
-    id: response.id,
-    domain,
-    projectId: workspace.id,
-    ...(workspace.plan !== "free" && {
-      url: target,
-    }),
-    rewrite: type === "rewrite",
+  return NextResponse.json(DomainSchema.parse(domainRecord), {
+    status: 201,
   });
-
-  return NextResponse.json(response);
 });
